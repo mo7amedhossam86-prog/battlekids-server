@@ -229,32 +229,47 @@ async def handler(ws):
             elif t == "create_party":
                 player_name = msg.get("name", "Host")
                 mode        = msg.get("mode", "coop")
+                is_public   = msg.get("public", True)
                 code        = gen_code()
                 while code in parties:
                     code = gen_code()
 
                 game = PartyGame(code, player_name, ws, mode)
-                parties[code] = game
-                party_code    = code
-                current_game  = code
+                game.is_public = is_public
+                parties[code]  = game
+                party_code     = code
+                current_game   = code
 
                 await ws.send(json.dumps({
                     "type": "party_created",
                     "code": code,
+                    "public": is_public,
+                    "mode": mode,
                 }))
 
             # ── Join party ──
             elif t == "join_party":
                 player_name = msg.get("name", "Player")
-                code        = msg.get("code", "").upper()
+                code        = msg.get("code", "").strip().upper()
 
-                if code not in parties:
-                    await ws.send(json.dumps({"type": "error", "msg": "كود الغرفة غلط"}))
+                # No code = join any public room
+                if not code:
+                    public_rooms = [(c, g) for c, g in parties.items()
+                                    if not g.started and g.mode != "private"]
+                    if public_rooms:
+                        code, game = public_rooms[0]
+                    else:
+                        await ws.send(json.dumps({"type": "error",
+                                                   "msg": "No public rooms available. Create one!"}))
+                        continue
+                elif code not in parties:
+                    await ws.send(json.dumps({"type": "error", "msg": "Wrong room code"}))
                     continue
+                else:
+                    game = parties[code]
 
-                game = parties[code]
                 if game.started:
-                    await ws.send(json.dumps({"type": "error", "msg": "اللعبة بدأت بالفعل"}))
+                    await ws.send(json.dumps({"type": "error", "msg": "Game already started"}))
                     continue
 
                 game.add_player(ws, player_name)
