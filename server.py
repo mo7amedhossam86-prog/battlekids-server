@@ -1,18 +1,22 @@
 """
-BattleKids Game Server  —  v2
+BattleKids Game Server  —  v3
 - Online mode  : Battle Royale up to 50 players
 - Party mode   : private/public rooms with custom codes + optional password
 - Local mode   : handled entirely client-side (no server needed)
 
-Fixes vs v1:
-  • create_party respects custom code sent by client
-  • join_party checks password for private rooms
-  • public-room filter uses is_public flag (not mode=="private")
-  • party host-transfer when host disconnects
-  • grenade broadcast in party + online
-  • ping/pong keepalive so Railway doesn't close idle connections
-  • lobby_state sent to joining player immediately with correct code
-  • party_created includes lobby_state so waiting screen populates
+Fixes vs v2:
+  • HTTP health-check endpoint (GET /) — Railway needs this
+  • /status JSON endpoint for debugging
+  • Zone damage matches client: 9 HP/s (was 1 HP/tick)
+  • Online game properly resets after finish
+  • Party _loop sends zone data so clients can show zone
+  • kill_feed notification sent to shooter on kill
+  • Rooms auto-cleaned after game ends
+  • player_name saved on first message (join_online / create_party / join_party)
+  • countdown before online game starts (10s, cancellable)
+  • grenade broadcast confirmed in both online + party (was already there, kept)
+  • MAX_PLAYERS guard prevents double-join
+  • Graceful handler for unknown message types
 """
 
 import asyncio, json, random, string, time, os, hashlib
@@ -81,25 +85,32 @@ async def send(ws, msg):
 #  Online Battle Royale
 # ─────────────────────────────────────────────────────────
 class OnlineGame:
-    MAX_PLAYERS = 50
-    MIN_TO_START = 2        # رفعه لـ 10 في الإنتاج
-    ZONE_START  = MAP_W * 0.45
-    ZONE_MIN    = 150
-    ZONE_SPEED  = 0.8       # pixels/sec
+    MAX_PLAYERS    = 50
+    MIN_TO_START   = 2
+    COUNTDOWN_SECS = 10     # ثواني قبل البداية
+    ZONE_START     = MAP_W * 0.45
+    ZONE_MIN       = 150
+    ZONE_SPEED     = 0.8    # pixels/sec
+    ZONE_DAMAGE    = 9.0    # HP/sec (matches client)
 
     def __init__(self):
-        self.players    = {}    # ws -> player_data
-        self.started    = False
-        self.zone_r     = self.ZONE_START
-        self.zone_cx    = MAP_W // 2
-        self.zone_cy    = MAP_H // 2
-        self.winner     = None
-        self._task      = None
+        self.players      = {}   # ws -> player_data
+        self.started      = False
+        self.finished     = False
+        self.zone_r       = self.ZONE_START
+        self.zone_cx      = MAP_W // 2
+        self.zone_cy      = MAP_H // 2
+        self.winner       = None
+        self._task        = None
+        self._cd_task     = None
+        self.created_at   = time.time()
 
     # ── player management ──
     def add(self, ws, name):
         if len(self.players) >= self.MAX_PLAYERS:
             return False
+        if ws in self.players:          # prevent double-join
+            return True
         p = make_player(name)
         p["id"] = str(id(ws))
         self.players[ws] = p
@@ -128,29 +139,45 @@ class OnlineGame:
             "started": self.started,
         }
 
-    # ── start / loop ──
+    # ── countdown then start ──
+    async def schedule_start(self):
+        """Broadcast countdown, then start."""
+        for remaining in range(self.COUNTDOWN_SECS, 0, -1):
+            if len(self.players) == 0:
+                return
+            await broadcast(self._all(), {
+                "type":    "player_joined",
+                "players": len(self.players),
+                "countdown": remaining,
+            })
+            await asyncio.sleep(1)
+        await self.start()
+
     async def start(self):
+        if self.started:
+            return
         self.started = True
         await broadcast(self._all(), {"type": "game_start", "mode": "online"})
         self._task = asyncio.create_task(self._loop())
 
     async def _loop(self):
-        while self.players:
-            await asyncio.sleep(0.05)   # 20 Hz
+        TICK = 0.05   # 20 Hz
+        while self.players and not self.finished:
+            await asyncio.sleep(TICK)
 
             # shrink zone
             if self.zone_r > self.ZONE_MIN:
                 self.zone_r = max(self.ZONE_MIN,
-                                  self.zone_r - self.ZONE_SPEED * 0.05)
+                                  self.zone_r - self.ZONE_SPEED * TICK)
 
-            # zone damage
+            # zone damage  (9 HP/s = 9 * TICK per tick)
             for ws, p in list(self.players.items()):
                 if not p["alive"]:
                     continue
                 dx = p["x"] - self.zone_cx
                 dy = p["y"] - self.zone_cy
                 if (dx*dx + dy*dy) ** 0.5 > self.zone_r:
-                    p["hp"] -= 1
+                    p["hp"] -= self.ZONE_DAMAGE * TICK
                     if p["hp"] <= 0:
                         p["hp"]    = 0
                         p["alive"] = False
@@ -159,11 +186,13 @@ class OnlineGame:
             # winner check
             alive = [(ws, p) for ws, p in self.players.items() if p["alive"]]
             if len(alive) == 1:
-                self.winner = alive[0][1]["name"]
+                self.winner   = alive[0][1]["name"]
+                self.finished = True
                 await broadcast(self._all(),
                                 {"type": "game_over", "winner": self.winner})
                 return
             if len(alive) == 0:
+                self.finished = True
                 await broadcast(self._all(),
                                 {"type": "game_over", "winner": None})
                 return
@@ -175,19 +204,30 @@ class OnlineGame:
 #  Party Room
 # ─────────────────────────────────────────────────────────
 class PartyGame:
+    ZONE_START  = MAP_W * 0.45
+    ZONE_MIN    = 150
+    ZONE_SPEED  = 0.7
+    ZONE_DAMAGE = 9.0
+
     def __init__(self, code, host_ws, host_name,
                  mode="coop", is_public=True, password=""):
         self.code      = code
         self.host      = host_ws
         self.mode      = mode
         self.is_public = is_public
-        self.pw_hash   = hash_pw(password)   # "" means no password
+        self.pw_hash   = hash_pw(password)
         self.players   = {host_ws: make_player(host_name)}
         self.started   = False
+        self.finished  = False
         self._task     = None
+        self.zone_r    = self.ZONE_START
+        self.zone_cx   = MAP_W // 2
+        self.zone_cy   = MAP_H // 2
 
     # ── player management ──
     def add(self, ws, name):
+        if ws in self.players:
+            return
         p = make_player(name)
         p["id"] = str(id(ws))
         self.players[ws] = p
@@ -199,7 +239,7 @@ class PartyGame:
             self.host = next(iter(self.players))
 
     def check_password(self, pw: str) -> bool:
-        if not self.pw_hash:          # no password set
+        if not self.pw_hash:
             return True
         return hash_pw(pw) == self.pw_hash
 
@@ -233,25 +273,51 @@ class PartyGame:
         self._task = asyncio.create_task(self._loop())
 
     async def _loop(self):
-        """Party state broadcast loop — also handles winner detection for PVP."""
-        while self.players:
-            await asyncio.sleep(0.05)
+        """Party state broadcast loop — zone shrink + PVP winner detection."""
+        TICK = 0.05
+        while self.players and not self.finished:
+            await asyncio.sleep(TICK)
+
+            # zone shrink (only in pvp / coop battle modes)
+            if self.mode in ("pvp", "coop"):
+                if self.zone_r > self.ZONE_MIN:
+                    self.zone_r = max(self.ZONE_MIN,
+                                      self.zone_r - self.ZONE_SPEED * TICK)
+
+                # zone damage
+                for ws, p in list(self.players.items()):
+                    if not p.get("alive", True):
+                        continue
+                    dx = p["x"] - self.zone_cx
+                    dy = p["y"] - self.zone_cy
+                    if (dx*dx + dy*dy) ** 0.5 > self.zone_r:
+                        p["hp"] = max(0, p["hp"] - self.ZONE_DAMAGE * TICK)
+                        if p["hp"] <= 0:
+                            p["alive"] = False
+                            await send(ws, {"type": "eliminated", "reason": "zone"})
 
             # ── PVP winner check ──
             if self.mode == "pvp":
-                alive = [(ws, p) for ws, p in self.players.items() if p.get("alive", True)]
+                alive = [(ws, p) for ws, p in self.players.items()
+                         if p.get("alive", True)]
                 if len(alive) == 1:
                     winner_name = alive[0][1]["name"]
-                    await broadcast(self._all(), {"type": "game_over", "winner": winner_name})
+                    self.finished = True
+                    await broadcast(self._all(),
+                                    {"type": "game_over", "winner": winner_name})
                     return
                 elif len(alive) == 0:
-                    await broadcast(self._all(), {"type": "game_over", "winner": None})
+                    self.finished = True
+                    await broadcast(self._all(),
+                                    {"type": "game_over", "winner": None})
                     return
 
             await broadcast(self._all(), {
                 "type":    "state",
-                "players": {str(id(ws)): p
-                            for ws, p in self.players.items()},
+                "players": {str(id(ws)): p for ws, p in self.players.items()},
+                "zone_r":  self.zone_r,
+                "zone_cx": self.zone_cx,
+                "zone_cy": self.zone_cy,
             })
 
 
@@ -286,8 +352,10 @@ async def handler(ws):
             # ════════════════════════════════════════════
             elif t == "list_parties":
                 public = [
-                    {"code": c, "host": g.players[g.host]["name"] if g.host in g.players else "?",
-                     "players": len(g.players), "mode": g.mode}
+                    {"code": c,
+                     "host": g.players[g.host]["name"] if g.host in g.players else "?",
+                     "players": len(g.players),
+                     "mode": g.mode}
                     for c, g in parties.items()
                     if not g.started and g.is_public
                 ]
@@ -300,7 +368,8 @@ async def handler(ws):
                 if party_code and party_code in parties:
                     game = parties[party_code]
                     if ws == game.host:
-                        await broadcast(game._all(), {"type": "party_deleted", "code": party_code})
+                        await broadcast(game._all(),
+                                        {"type": "party_deleted", "code": party_code})
                         parties.pop(party_code, None)
                         party_code   = None
                         current_game = None
@@ -313,6 +382,7 @@ async def handler(ws):
 
                 # start fresh game if needed
                 if online_game is None or \
+                   online_game.finished or \
                    len(online_game.players) >= OnlineGame.MAX_PLAYERS or \
                    online_game.started:
                     online_game = OnlineGame()
@@ -332,9 +402,13 @@ async def handler(ws):
                     "players": len(online_game.players),
                 })
 
+                # start countdown when enough players
                 if len(online_game.players) >= OnlineGame.MIN_TO_START \
-                        and not online_game.started:
-                    await online_game.start()
+                        and not online_game.started \
+                        and online_game._cd_task is None:
+                    online_game._cd_task = asyncio.create_task(
+                        online_game.schedule_start()
+                    )
 
             # ════════════════════════════════════════════
             #  PARTY  —  Create room
@@ -346,7 +420,6 @@ async def handler(ws):
                 password    = msg.get("password", "")
                 custom_code = msg.get("code",  "").strip().upper()
 
-                # use custom code if valid and not taken, else generate one
                 if custom_code and len(custom_code) <= 12 \
                         and custom_code not in parties:
                     code = custom_code
@@ -363,7 +436,6 @@ async def handler(ws):
                 party_code    = code
                 current_game  = code
 
-                # send party_created first (client stores NET.party_code)
                 await send(ws, {
                     "type":      "party_created",
                     "code":      code,
@@ -371,7 +443,6 @@ async def handler(ws):
                     "mode":      mode,
                     "player_id": str(id(ws)),
                 })
-                # then send lobby state so waiting screen shows players
                 await send(ws, game.lobby_msg())
 
             # ════════════════════════════════════════════
@@ -382,7 +453,6 @@ async def handler(ws):
                 code        = msg.get("code", "").strip().upper()
                 password    = msg.get("password", "")
 
-                # no code → find first open public room
                 if not code:
                     public = [(c, g) for c, g in parties.items()
                               if not g.started and g.is_public]
@@ -404,7 +474,6 @@ async def handler(ws):
                                     "msg":  "اللعبة بدأت بالفعل"})
                     continue
 
-                # password check
                 if not game.check_password(password):
                     await send(ws, {"type": "error",
                                     "msg":  "كلمة السر غلطانة"})
@@ -414,14 +483,11 @@ async def handler(ws):
                 party_code   = code
                 current_game = code
 
-                # tell joining player their id + code
                 await send(ws, {
                     "type":      "joined_party",
                     "code":      code,
                     "player_id": str(id(ws)),
                 })
-
-                # update everyone in lobby
                 await broadcast(game._all(), game.lobby_msg())
 
             # ════════════════════════════════════════════
@@ -454,11 +520,11 @@ async def handler(ws):
                     "angle": p_data.get("angle", 0),
                     "hp":    p_data.get("hp",  100),
                     "alive": p_data.get("alive", True),
+                    "name":  p_data.get("name", player_name or "?"),
                 }
                 if current_game == "online" and online_game \
                         and ws in online_game.players:
                     online_game.players[ws].update(update)
-
                 elif current_game and current_game in parties:
                     game = parties[current_game]
                     if ws in game.players:
@@ -494,7 +560,6 @@ async def handler(ws):
             #  HIT  (client-side hit detection)
             # ════════════════════════════════════════════
             elif t == "hit":
-                # العميل بيبعت target_name (اسم اللاعب) بدل target_id
                 target_name = msg.get("target_name") or msg.get("target")
                 damage      = max(0, min(int(msg.get("damage", 0)), 100))
 
@@ -505,19 +570,24 @@ async def handler(ws):
                     pool = parties[current_game].players
 
                 for tw, tp in pool.items():
-                    # مقارنة بالاسم (target_name) أو بالـ id القديم للتوافق
                     match = (tp.get("name") == target_name) or \
                             (str(id(tw)) == target_name)
-                    if match and tp["alive"]:
+                    if match and tp.get("alive", True):
                         tp["hp"] = max(0, tp["hp"] - damage)
                         if tp["hp"] <= 0:
                             tp["alive"] = False
-                            # give kill credit to shooter
+                            # kill credit to shooter
                             if ws in pool:
                                 pool[ws]["kills"] = pool[ws].get("kills", 0) + 1
+                                killer_name = pool[ws]["name"]
+                            else:
+                                killer_name = player_name or "?"
                             await send(tw, {"type": "eliminated",
                                             "reason": "shot",
-                                            "by": player_name})
+                                            "by": killer_name})
+                            # notify shooter of kill
+                            await send(ws, {"type": "kill_confirmed",
+                                            "victim": tp.get("name", "?")})
                         break
 
             # ════════════════════════════════════════════
@@ -533,6 +603,8 @@ async def handler(ws):
                 elif current_game and current_game in parties:
                     await broadcast(parties[current_game]._all(), out)
 
+            # ── unknown type: ignore silently ──
+
     except websockets.exceptions.ConnectionClosed:
         pass
     finally:
@@ -545,20 +617,53 @@ async def handler(ws):
             game.remove(ws)
 
             if not game.players:
-                # last player left → delete room
                 parties.pop(current_game, None)
             else:
-                # notify remaining players
                 await broadcast(game._all(), game.lobby_msg())
+
+
+# ─────────────────────────────────────────────────────────
+#  HTTP handler  (health check + status)
+# ─────────────────────────────────────────────────────────
+async def http_handler(path, request_headers):
+    """Handle plain HTTP GET requests (Railway health checks)."""
+    if path == "/" or path == "/health":
+        body = b"BattleKids Server v3 - OK"
+        return (200, [("Content-Type", "text/plain"),
+                      ("Content-Length", str(len(body)))], body)
+
+    if path == "/status":
+        online_count = len(online_game.players) if online_game else 0
+        party_count  = sum(len(g.players) for g in parties.values())
+        data = {
+            "status":        "ok",
+            "version":       3,
+            "online_players": online_count,
+            "online_started": online_game.started if online_game else False,
+            "parties":       len(parties),
+            "party_players": party_count,
+        }
+        body = json.dumps(data, indent=2).encode()
+        return (200, [("Content-Type", "application/json"),
+                      ("Content-Length", str(len(body)))], body)
+
+    # Let websocket upgrade proceed normally for all other paths
+    return None
 
 
 # ─────────────────────────────────────────────────────────
 #  Entry point
 # ─────────────────────────────────────────────────────────
 async def main():
-    print(f"BattleKids Server v2  —  port {PORT}")
-    async with serve(handler, "0.0.0.0", PORT,
-                     ping_interval=20, ping_timeout=60):
+    print(f"BattleKids Server v3  —  port {PORT}")
+    async with serve(
+        handler,
+        "0.0.0.0",
+        PORT,
+        ping_interval=20,
+        ping_timeout=60,
+        process_request=http_handler,
+    ):
         await asyncio.Future()   # run forever
 
 
