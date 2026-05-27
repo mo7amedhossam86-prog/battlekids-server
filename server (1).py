@@ -584,6 +584,8 @@ async def handler(ws):
             elif t == "hit":
                 target_name = msg.get("target_name") or msg.get("target")
                 damage      = max(0, min(int(msg.get("damage", 0)), 100))
+                # FIX-3: killer_id من الكلاينت (أدق من ws)
+                killer_id_h = msg.get("killer_id")
                 pool = {}
                 if current_game == "online" and online_game:
                     pool = online_game.players
@@ -595,12 +597,19 @@ async def handler(ws):
                         tp["hp"] = max(0, tp["hp"] - damage)
                         if tp["hp"] <= 0:
                             tp["alive"] = False
-                            if ws in pool:
-                                pool[ws]["kills"] = pool[ws].get("kills", 0) + 1
+                            # حدد الـ killer ws
+                            killer_ws_h = None
+                            if killer_id_h:
+                                for _ows in pool:
+                                    if str(id(_ows)) == killer_id_h:
+                                        killer_ws_h = _ows; break
+                            killer_ws_h = killer_ws_h or ws
+                            if killer_ws_h in pool:
+                                pool[killer_ws_h]["kills"] = pool[killer_ws_h].get("kills", 0) + 1
                             await safe_send(tw, {"type": "eliminated",
                                                  "reason": "shot",
                                                  "by": player_name or "?"})
-                            await safe_send(ws, {"type": "kill_confirmed",
+                            await safe_send(killer_ws_h, {"type": "kill_confirmed",
                                                  "victim": tp.get("name", "?")})
                         break
 
