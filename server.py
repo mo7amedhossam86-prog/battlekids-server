@@ -63,8 +63,7 @@ async def broadcast(clients, msg):
     coros = []
     for ws in list(clients):
         try:
-            if not ws.closed:
-                coros.append(ws.send(data))
+            coros.append(ws.send(data))
         except Exception:
             pass
     if coros:
@@ -73,8 +72,7 @@ async def broadcast(clients, msg):
 
 async def send(ws, msg):
     try:
-        if not ws.closed:
-            await ws.send(json.dumps(msg))
+        await ws.send(json.dumps(msg))
     except Exception:
         pass
 
@@ -234,8 +232,21 @@ class PartyGame:
         self._task = asyncio.create_task(self._loop())
 
     async def _loop(self):
+        """Party state broadcast loop — also handles winner detection for PVP."""
         while self.players:
             await asyncio.sleep(0.05)
+
+            # ── PVP winner check ──
+            if self.mode == "pvp":
+                alive = [(ws, p) for ws, p in self.players.items() if p.get("alive", True)]
+                if len(alive) == 1:
+                    winner_name = alive[0][1]["name"]
+                    await broadcast(self._all(), {"type": "game_over", "winner": winner_name})
+                    return
+                elif len(alive) == 0:
+                    await broadcast(self._all(), {"type": "game_over", "winner": None})
+                    return
+
             await broadcast(self._all(), {
                 "type":    "state",
                 "players": {str(id(ws)): p
@@ -268,6 +279,30 @@ async def handler(ws):
             # ════════════════════════════════════════════
             if t == "ping":
                 await send(ws, {"type": "pong"})
+
+            # ════════════════════════════════════════════
+            #  LIST PUBLIC PARTIES
+            # ════════════════════════════════════════════
+            elif t == "list_parties":
+                public = [
+                    {"code": c, "host": g.players[g.host]["name"] if g.host in g.players else "?",
+                     "players": len(g.players), "mode": g.mode}
+                    for c, g in parties.items()
+                    if not g.started and g.is_public
+                ]
+                await send(ws, {"type": "parties_list", "parties": public})
+
+            # ════════════════════════════════════════════
+            #  DELETE PARTY  (host only)
+            # ════════════════════════════════════════════
+            elif t == "delete_party":
+                if party_code and party_code in parties:
+                    game = parties[party_code]
+                    if ws == game.host:
+                        await broadcast(game._all(), {"type": "party_deleted", "code": party_code})
+                        parties.pop(party_code, None)
+                        party_code   = None
+                        current_game = None
 
             # ════════════════════════════════════════════
             #  ONLINE  —  Battle Royale
