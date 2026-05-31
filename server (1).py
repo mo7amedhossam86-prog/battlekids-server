@@ -596,7 +596,7 @@ async def handler(ws):
 
                 shooter_name = pool.get(ws, {}).get("name") if ws in pool else (player_name or "?")
 
-                for tw, tp in pool.items():
+                for tw, tp in list(pool.items()):
                     if tw is ws:           # prevent self-hit
                         continue
                     match = (tp.get("name") == target_name) or \
@@ -698,3 +698,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+  
